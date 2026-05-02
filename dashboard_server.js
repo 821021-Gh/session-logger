@@ -421,15 +421,42 @@ async function handleAPI(action) {
     case 'clear': { deleteCSV(); return { ok: true }; }
     case 'chart': {
       const cd = {};
+      const now = Date.now();
+
+      // Build per-account sessions: LOGIN timestamps + LOGOUT timestamps
+      const sessions = {}; // account -> [{login: ts, logout: ts|null}]
       for (const r of rows) {
-        if (r.event_type === 'LOGOUT' && r.account && r.account !== 'System') {
-          const date = (r.timestamp || '').slice(0, 10);
-          const acc = r.account;
-          const mins = parseFloat(r.duration_minutes || 0);
-          if (date) {
-            if (!cd[date]) cd[date] = {};
-            cd[date][acc] = (cd[date][acc] || 0) + mins;
+        const etype = r.event_type;
+        const acc = r.account;
+        if (!acc || acc === 'System' || !['LOGIN','LOGOUT'].includes(etype)) continue;
+        const ts = new Date(r.timestamp).getTime();
+        if (!sessions[acc]) sessions[acc] = [];
+        if (etype === 'LOGIN') {
+          sessions[acc].push({ login: ts, logout: null });
+        } else {
+          // Match to most recent unclosed session
+          for (let i = sessions[acc].length - 1; i >= 0; i--) {
+            if (sessions[acc][i].logout === null) {
+              sessions[acc][i].logout = ts;
+              break;
+            }
           }
+        }
+      }
+
+      // Aggregate: for each session, compute duration and add to its date
+      for (const acc in sessions) {
+        for (const s of sessions[acc]) {
+          const loginDate = new Date(s.login).toISOString().slice(0, 10);
+          let mins;
+          if (s.logout !== null) {
+            mins = Math.round((s.logout - s.login) / 60000);
+          } else {
+            // Active session: use LOGIN-to-now duration
+            mins = Math.round((now - s.login) / 60000);
+          }
+          if (!cd[loginDate]) cd[loginDate] = {};
+          cd[loginDate][acc] = (cd[loginDate][acc] || 0) + mins;
         }
       }
       return { data: cd };

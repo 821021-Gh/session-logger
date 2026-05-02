@@ -1,6 +1,8 @@
 ﻿#Requires -Version 5.1
-# Session Logger v6 — Tracks all user logins/logouts
-# Uses query user (primary) — now with correct AM/PM detection
+# Session Logger v7 — Tracks all user logins/logouts
+# Logic: compare current sessions vs previous state
+#   - New account appeared  → write LOGIN
+#   - Known account gone    → write LOGOUT (with session duration)
 # Runs every minute via SessionLogger_Track scheduled task
 
 param(
@@ -25,32 +27,12 @@ function Append-Csv {
     Add-Content -Path $CsvPath -Value $line -Encoding UTF8
 }
 
-function Get-CsvRows {
-    if (-not (Test-Path $CsvPath)) { return @() }
-    $lines = Get-Content $CsvPath -ErrorAction SilentlyContinue
-    if ($lines.Count -le 1) { return @() }
-    return @($lines[1..($lines.Count-1)])
-}
-
-function AlreadyToday {
-    param($account, $type)
-    $today = [DateTime]::Now.ToString("yyyy-MM-dd")
-    foreach ($r in Get-CsvRows) {
-        $p = $r.Split(",")
-        if ($p.Count -ge 4 -and $p[0].StartsWith($today) -and $p[1] -eq $type -and $p[2] -eq $account) {
-            return $true
-        }
-    }
-    return $false
-}
-
-# ── Parse query user ─────────────────────────────────────────────────────────
-# The garbled output: 上午/下午 (AM/PM) is Big5 bytes displayed as UTF-8 garbage.
-# Big5: 上午 = 3 bytes → 3 UTF-8 chars; 下午 = 4 bytes → 4 UTF-8 chars
-# We count the token length to distinguish them.
+# ── Parse query user ──────────────────────────────────────────────────────────
+# Big5/UTF-8 garbled AM/PM marker:
+#   上午 (AM) = 3 UTF-8 chars, 下午 (PM) = 4 UTF-8 chars
 
 function Get-QueryUserSessions {
-    $tmpOut = "$env:TEMP\_qu_v6.txt"
+    $tmpOut = "$env:TEMP\_qu_v7.txt"
     Remove-Item $tmpOut -Force -ErrorAction SilentlyContinue
     $null = Start-Process "query.exe" -ArgumentList "user" -NoNewWindow -Wait -PassThru `
         -RedirectStandardOutput $tmpOut -RedirectStandardError "$env:TEMP\_qu_err.txt"
@@ -67,50 +49,30 @@ function Get-QueryUserSessions {
                 $tokens = $line.Trim() -split '\s+'
                 if ($tokens.Count -lt 7) { continue }
 
-                # tokens[0] = USERNAME or >username
-                # tokens[5] = YYYY/M/D
-                # tokens[6] = garbled AM/PM (3 chars = 上午=AM, 4 chars = 下午=PM)
-                # tokens[7] = HH:MM
-
                 $rawName = $tokens[0] -replace "^>", ""
                 $rawName = ($rawName -split ":")[0].Trim()
 
                 if ([string]::IsNullOrWhiteSpace($rawName)) { continue }
                 if ($rawName -notmatch "^[\w\-\.]+$") { continue }
                 if ($rawName.Length -gt 50) { continue }
-                if ($rawName -match "^(USERNAME|SESSIONNAME|console|ID|STATE|Active|Disc|Idle|TIME|none)$") { continue }
 
-                # Parse time — AM=add 0, PM=add 12
-                # 上午 (AM) = 3 UTF-8 chars; 下午 (PM) = 4 UTF-8 chars
+                # Parse time — detect PM by garbled token length
                 $hour = 0; $minute = 0
                 $isPM = $false
                 if ($tokens.Count -ge 8) {
-                    $garbled = $tokens[6]
-                    if ($garbled.Length -ge 4) { $isPM = $true }  # 下午 (PM)
+                    if ($tokens[6].Length -ge 4) { $isPM = $true }
                     $hhmm = $tokens[7] -split ":"
-                    try {
-                        $hour = [int]$hhmm[0]
-                        $minute = [int]$hhmm[1]
-                    } catch {}
                 } elseif ($tokens.Count -ge 7) {
-                    $garbled = $tokens[6]
-                    $hhmm = $garbled -split ":"
+                    $hhmm = $tokens[6] -split ":"
                     if ($hhmm.Count -lt 2) {
-                        # tokens[6] is garbled, tokens[7] has time
-                        $garbled2 = $tokens[6]
-                        if ($garbled2.Length -ge 4) { $isPM = $true }
                         $hhmm = $tokens[7] -split ":"
-                        try {
-                            $hour = [int]$hhmm[0]
-                            $minute = [int]$hhmm[1]
-                        } catch {}
-                    } else {
-                        try {
-                            $hour = [int]$hhmm[0]
-                            $minute = [int]$hhmm[1]
-                        } catch {}
+                        if ($tokens[6].Length -ge 4) { $isPM = $true }
                     }
                 }
+                try {
+                    $hour = [int]$hhmm[0]
+                    $minute = [int]$hhmm[1]
+                } catch {}
 
                 if ($isPM -and $hour -lt 12) { $hour += 12 }
                 if ($hour -ge 24) { $hour -= 24 }
@@ -148,57 +110,59 @@ function Save-State {
     [System.IO.File]::WriteAllText($StateFile, $json, [System.Text.Encoding]::UTF8)
 }
 
+# ── BOOT ──────────────────────────────────────────────────────────────────────
+
+function Log-BootOnce {
+    $today = [DateTime]::Now.ToString("yyyy-MM-dd")
+    if (Test-Path $CsvPath) {
+        $lines = Get-Content $CsvPath -ErrorAction SilentlyContinue
+        foreach ($r in $lines) {
+            if ($r -match ",BOOT,System," -and $r.StartsWith($today)) { return }
+        }
+    }
+    try {
+        $os = Get-CimInstance -ClassName Win32_OperatingSystem
+        $bootTime = $os.LastBootUpTime
+        $mins = [Math]::Round(([DateTime]::Now - $bootTime).TotalMinutes)
+        Append-Csv "$($bootTime.ToString('yyyy-MM-dd HH:mm:ss')),BOOT,System,$mins"
+    } catch {}
+}
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 Init-Csv
 $now = [DateTime]::Now
 $state = Load-State
-$today = $now.ToString("yyyy-MM-dd")
 
+# Get current active sessions
 $sessions = Get-QueryUserSessions
 
-# ── 1. Log BOOT once per day ─────────────────────────────────────────────────
-$bootLogged = $false
-foreach ($r in Get-CsvRows) {
-    if ($r -match ",BOOT,System," -and $r.StartsWith($today)) { $bootLogged = $true; break }
-}
-if (-not $bootLogged) {
-    try {
-        $os = Get-CimInstance -ClassName Win32_OperatingSystem
-        $bootTime = $os.LastBootUpTime
-        $mins = [Math]::Round(($now - $bootTime).TotalMinutes)
-        Append-Csv "$($bootTime.ToString('yyyy-MM-dd HH:mm:ss')),BOOT,System,$mins"
-    } catch {}
-}
+# Build lookup hashmap
+$currentActive = @{}
+foreach ($s in $sessions) { $currentActive[$s.account] = $s }
 
-# ── 2. LOGIN — new sessions not in state.known ───────────────────────────────
-$loggedIn = @{}
+# ── LOGIN: in current sessions but NOT in previous known list ─────────────────
 foreach ($s in $sessions) {
     $acc = $s.account
-    $loggedIn[$acc] = $true
     if ($acc -notin $state.known) {
-        if (-not (AlreadyToday $acc "LOGIN")) {
-            Append-Csv "$($s.logonTime.ToString('yyyy-MM-dd HH:mm:ss')),LOGIN,$acc,0"
-        }
+        Append-Csv "$($s.logonTime.ToString('yyyy-MM-dd HH:mm:ss')),LOGIN,$acc,0"
     }
 }
 
-# ── 3. LOGOUT — known users who are now gone ─────────────────────────────────
-foreach ($acc in $state.known) {
-    if (-not $loggedIn.ContainsKey($acc)) {
-        if (-not (AlreadyToday $acc "LOGOUT")) {
-            $minutes = 0
-            try {
-                $loginTs = [DateTime]::Parse($state.loginTimes[$acc])
-                $minutes = [Math]::Round(($now - $loginTs).TotalMinutes)
-                if ($minutes -lt 0 -or $minutes -gt 1440) { $minutes = 0 }
-            } catch {}
-            Append-Csv "$($now.ToString('yyyy-MM-dd HH:mm:ss')),LOGOUT,$acc,$minutes"
-        }
+# ── LOGOUT: was in previous known list but NOT in current sessions ────────────
+foreach ($prevAcc in $state.known) {
+    if (-not $currentActive.ContainsKey($prevAcc)) {
+        $minutes = 0
+        try {
+            $loginTs = [DateTime]::Parse($state.loginTimes[$prevAcc])
+            $minutes = [Math]::Round(($now - $loginTs).TotalMinutes)
+            if ($minutes -lt 0 -or $minutes -gt 1440) { $minutes = 0 }
+        } catch {}
+        Append-Csv "$($now.ToString('yyyy-MM-dd HH:mm:ss')),LOGOUT,$prevAcc,$minutes"
     }
 }
 
-# ── 4. Update state ──────────────────────────────────────────────────────────
+# ── Update state ──────────────────────────────────────────────────────────────
 $state.known = @($sessions | ForEach-Object { $_.account })
 $state.loginTimes = @{}
 foreach ($s in $sessions) {
@@ -206,4 +170,7 @@ foreach ($s in $sessions) {
 }
 Save-State $state
 
-Write-Host "Sessions: $($sessions.Count) active | State saved."
+# ── BOOT ──────────────────────────────────────────────────────────────────────
+Log-BootOnce
+
+Write-Output "OK: $($sessions.Count) active | LOGIN=$($sessions.Count) LOGOUT=$( [Math]::Max(0, $state.known.Count - $sessions.Count) )"
