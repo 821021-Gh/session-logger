@@ -1,0 +1,30 @@
+# SessionLogger - GitIgnore
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Temp/debug files
+*.txt
+*.tmp
+_consolidate-state.json
+
+# OpenClaw system
+.openclaw/
+
+# OpenClaw workspace files (personal)
+memory/
+IDENTITY.md
+SOUL.md
+AGENTS.md
+HEARTBEAT.md
+TOOLS.md
+USER.md
+MEMORY.md
+
+# Local data (not tracked)
+session_log.csv
+session_state.json
+report.xlsx
+*.html
+*.lnk
